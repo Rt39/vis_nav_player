@@ -9,3 +9,5 @@ __pycache__/
 data/
 /dist
 *egg-info
+
+/.conda
