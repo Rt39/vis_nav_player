@@ -1,8 +1,14 @@
+from dataclasses import dataclass
+import vis_nav_game
+from enum import Enum
+from typing import Dict, List, Tuple
 import cv2
 import os
 import pickle
 import numpy as np
+import networkx as nx
 from natsort import natsorted
+import pygame
 from tqdm import tqdm
 from player import KeyboardPlayerPyGame
 
@@ -110,160 +116,244 @@ class ImageFeatureExtractor:
         normalized_vlad = self.normalize_vlad(vlad_vector)
         
         return normalized_vlad
+
+class ActionType(Enum):
+    """Possible actions in the maze"""
+    FORWARD = "FORWARD"
+    BACKWARD = "BACKWARD"
+    LEFT_TURN = "LEFT_TURN"
+    RIGHT_TURN = "RIGHT_TURN"
+    UNKNOWN = "UNKNOWN"
+
+@dataclass
+class Node:
+    """Represents a location in the maze"""
+    id: int
+    features: np.ndarray  # VLAD features of this location
+    image: np.ndarray    # Representative image of this location
+    neighbors: Dict[ActionType, int] = None  # Mapping of action to neighbor node ids
     
-class ImageDatabase:
-    """
-    ImageDatabase类用于存储图像特征并进行快速近邻搜索。
-    方法:
-        __init__():
-            初始化ImageDatabase对象，创建一个空的特征列表和一个空的搜索树。
-        add_feature(feature):
-            添加一个特征到数据库。
-        build_search_tree(leaf_size=64):
-            构建搜索树以便进行快速近邻搜索。
-        find_nearest(query_feature, k=1):
-            找到最相似的k个特征的索引。
-    """
-    def __init__(self):
-        self.features = []  # 存储所有图像的特征
-        self.tree = None    # 用于快速近邻搜索
+    def __post_init__(self):
+        if self.neighbors is None:
+            self.neighbors = {}
+
+class MazeMapper:
+    def __init__(self, feature_params: dict = None):
+        # Initialize basic structures
+        self.nodes: Dict[int, Node] = {}
+        self.graph = nx.Graph()
         
-    def add_feature(self, feature):
-        """
-        添加一个特征到数据库
-
-        参数:
-        feature: 要添加到数据库的特征
-        """
-        self.features.append(feature)
+        # Initialize feature extractor
+        if feature_params is None:
+            feature_params = {'n_clusters': 128}
+        self.feature_extractor = ImageFeatureExtractor(**feature_params)
         
-    def build_search_tree(self, leaf_size=64):
-        """
-        构建搜索树
-
-        参数:
-        leaf_size (int): 每个叶子节点的最大样本数。默认值为64。
-        """
-        self.tree = BallTree(self.features, leaf_size=leaf_size)
+        # Initialize similarity search structure
+        self.feature_tree = None
+        self.similarity_threshold = 0.85  # Threshold for considering locations similar
         
-    def find_nearest(self, query_feature, k=1):
-        """
-        找到与查询特征最相似的k个特征的索引。
+    def build_maze_map(self, exploration_images: List[np.ndarray]) -> None:
+        """Build maze map from exploration data"""
+        print("Building maze map...")
+        
+        # 1. Extract SIFT features from all images and train codebook
+        print("Training feature extractor...")
+        all_descriptors = self.feature_extractor.extract_sift_batch(exploration_images)
+        self.feature_extractor.train_codebook(all_descriptors)
+        
+        # 2. Process each image and create initial nodes
+        print("Creating initial nodes...")
+        features_list = []
+        for idx, img in enumerate(tqdm(exploration_images, desc="Processing images")):
+            # Compute VLAD features
+            features = self.feature_extractor.compute_image_descriptor(img)
+            
+            # Create new node
+            node = Node(id=idx, features=features, image=img)
+            self.nodes[idx] = node
+            features_list.append(features)
+            
+        # 3. Build feature tree for similarity search
+        self.feature_tree = BallTree(np.array(features_list))
+        
+        # 4. Connect similar locations
+        self._connect_similar_locations()
+        
+        # 5. Analyze sequential connections
+        self._analyze_sequential_connections(exploration_images)
+        
+        print("Maze map building completed.")
 
-        参数:
-        query_feature (array-like): 查询的特征向量。
-        k (int): 要找到的最相似特征的数量，默认为1。
-
-        返回:
-        tuple: 包含两个元素的元组，第一个元素是最相似特征的索引数组，第二个元素是对应的距离数组。
-
-        异常:
-        ValueError: 如果搜索树尚未构建，则抛出此异常。
-        """
-        if self.tree is None:
-            raise ValueError("Search tree not built! Call build_search_tree first.")
-        distances, indices = self.tree.query([query_feature], k=k)
-        return indices[0], distances[0]
-
-class TopoNode:
-    """
-    TopoNode类表示拓扑图中的一个节点。
-
-    属性:
-        id (int): 节点的唯一标识符。
-        img_feature (Any): 节点的图像特征。
-        neighbors (dict): 邻接表，表示与该节点相邻的节点及其边的权重。
-
-    方法:
-        __init__(id, img_feature): 初始化TopoNode类的新实例。
-    """
-    def __init__(self, id, img_feature):
-        self.id = id
-        self.img_feature = img_feature  # 图像特征
-        self.neighbors = {}             # 邻接表 {node_id: edge_weight}
-
-class TopoMap:
-    """
-    TopoMap 类表示一个拓扑地图，其中包含节点和边。
-
-    属性:
-        nodes (dict): 存储节点的字典，键为节点 ID，值为 TopoNode 对象。
-        current_node_id (int 或 None): 当前节点的 ID。
-
-    方法:
-        __init__(): 初始化 TopoMap 对象。
-        add_node(id, img_feature): 添加一个节点到拓扑地图中。
-        add_edge(id1, id2, weight): 在两个节点之间添加一条边。
-    """
-    def __init__(self):
-        self.nodes = {}                 # {node_id: TopoNode}
-        self.current_node_id = None     # 当前节点
-
-    def add_node(self, id, img_feature):
-        self.nodes[id] = TopoNode(id, img_feature)
-
-    def add_edge(self, id1, id2, weight):
-        if id1 not in self.nodes or id2 not in self.nodes:
-            return
-        self.nodes[id1].neighbors[id2] = weight
-        self.nodes[id2].neighbors[id1] = weight
+    def _connect_similar_locations(self) -> None:
+        """Connect nodes that represent similar locations"""
+        print("Connecting similar locations...")
+        
+        features_array = np.array([node.features for node in self.nodes.values()])
+        
+        # Find similar locations using BallTree
+        distances, indices = self.feature_tree.query(features_array, k=5)
+        
+        for i, (dists, idxs) in enumerate(zip(distances, indices)):
+            for dist, idx in zip(dists[1:], idxs[1:]):  # Skip first (self)
+                if dist < self.similarity_threshold:
+                    self.graph.add_edge(i, int(idx))
+    
+    def _analyze_sequential_connections(self, exploration_images: List[np.ndarray]) -> None:
+        """Analyze connections between sequential frames"""
+        print("Analyzing sequential connections...")
+        
+        for i in range(len(exploration_images) - 1):
+            curr_node = self.nodes[i]
+            next_node = self.nodes[i + 1]
+            
+            # Determine action type based on image analysis
+            action = self._determine_action(curr_node.image, next_node.image)
+            
+            # Add connection to graph
+            self.graph.add_edge(curr_node.id, next_node.id, action=action)
+            
+            # Update node neighbors
+            curr_node.neighbors[action] = next_node.id
+            next_node.neighbors[self._get_reverse_action(action)] = curr_node.id
+    
+    def _determine_action(self, img1: np.ndarray, img2: np.ndarray) -> ActionType:
+        """Determine the action between two sequential frames"""
+        # TODO: Implement more sophisticated action detection
+        # Currently returns UNKNOWN as placeholder
+        return ActionType.UNKNOWN
+    
+    def _get_reverse_action(self, action: ActionType) -> ActionType:
+        """Get the reverse of an action"""
+        action_pairs = {
+            ActionType.FORWARD: ActionType.BACKWARD,
+            ActionType.BACKWARD: ActionType.FORWARD,
+            ActionType.LEFT_TURN: ActionType.RIGHT_TURN,
+            ActionType.RIGHT_TURN: ActionType.LEFT_TURN,
+            ActionType.UNKNOWN: ActionType.UNKNOWN
+        }
+        return action_pairs[action]
+    
+    def find_similar_location(self, query_image: np.ndarray, k: int = 1) -> List[Tuple[int, float]]:
+        """Find k most similar locations to query image"""
+        # Extract features from query image
+        query_features = self.feature_extractor.compute_image_descriptor(query_image)
+        
+        # Find nearest neighbors
+        distances, indices = self.feature_tree.query(query_features.reshape(1, -1), k=k)
+        
+        # Return list of (node_id, similarity_score) pairs
+        return [(int(idx), 1 - dist) for dist, idx in zip(distances[0], indices[0])]
+    
+    def get_node_neighbors(self, node_id: int) -> Dict[ActionType, int]:
+        """Get neighbors of a node"""
+        return self.nodes[node_id].neighbors
+    
+    def visualize_map(self, output_path: str = "maze_map.png") -> None:
+        """Visualize the maze map"""
+        # TODO: Implement visualization
+        # Could use networkx's drawing functions or custom visualization
+        pass
 
 class SolutionPlayer(KeyboardPlayerPyGame):
     def __init__(self):
         super(KeyboardPlayerPyGame, self).__init__()
 
+        self.count = 0  # 保存图像的计数
+
         # 新增的组件
-        self.topo_map = TopoMap()
+        self.mapper = MazeMapper()
         self.feature_extractor = ImageFeatureExtractor()
-        self.image_database = ImageDatabase()
+        self.feature_database = []
 
     # 重写pre_navigation方法
     # Override
     def pre_navigation(self):
-        print("Starting pre-navigation setup...")
+        pass    # TODO: 在导航阶段之前执行的计算
 
-        # 1. 加载探索数据
-        images, image_ids = self._load_exploration_data()
+    # 重写see方法
+    # Override
+    def see(self, fpv):
+        """
+        Set the first-person view input
+        """
 
-        # 2. 提取图像特征
-        print("Extracting SIFT features...")
-        all_descriptors = self.feature_extractor.extract_sift_batch(images)
-        self.feature_extractor.train_codebook(all_descriptors)
+        # Return if fpv is not available
+        if fpv is None or len(fpv.shape) < 3:
+            return
 
-        # 3. 构建图像数据库和拓扑地图
-        print("Building database and topological map...")
-        for i, img in enumerate(tqdm(images, desc="Processing images")):
-            # 提取特征
-            feature = self.feature_extractor.compute_image_descriptor(img)
-            # 添加到数据库
-            self.database.add_feature(feature)
-            # 添加到拓扑图
-            self.topo_map.add_node(i, feature)
-            
-            # 添加时序相邻的边
-            if i > 0:
-                weight = np.linalg.norm(feature - self.database.features[i-1])
-                self.topo_map.add_edge(i, i-1, weight)
+        self.fpv = fpv
 
-        # 4. 构建搜索树
-        print("Building search tree...")
-        self.database.build_search_tree()
+        # If the pygame screen has not been initialized, initialize it with the size of the fpv image
+        # This allows subsequent rendering of the first-person view image onto the pygame screen
+        if self.screen is None:
+            h, w, _ = fpv.shape
+            self.screen = pygame.display.set_mode((w, h))
 
-    def _load_exploration_data(self):
+        def convert_opencv_img_to_pygame(opencv_image):
+            """
+            Convert OpenCV images for Pygame.
+
+            see https://blanktar.jp/blog/2016/01/pygame-draw-opencv-image.html
+            """
+            opencv_image = cv2.cvtColor(opencv_image, cv2.COLOR_BGR2RGB)  # BGR->RGB
+            shape = opencv_image.shape[1::-1]  # (height,width,Number of colors) -> (width, height)
+            pygame_image = pygame.image.frombuffer(opencv_image.tobytes(), shape, 'RGB')
+
+            return pygame_image
+
+        pygame.display.set_caption("KeyboardPlayer:fpv")
+
+        # If game has started
+        if self._state:
+            # If in exploration stage
+            if self._state[1] == vis_nav_game.Phase.EXPLORATION:
+                # TODO: 在实际应用中，探索数据会被给出，这里我们自行探索数据
+
+                # Get full absolute save path
+                save_dir_full = os.path.join(os.path.dirname(__file__), data_path)
+                save_path = save_dir_full + str(self.count) + ".jpg"
+                # Save current FPV
+                cv2.imwrite(save_path, fpv)
+
+                # Get VLAD embedding for current FPV and add it to the database
+                VLAD = self.feature_extractor.compute_image_descriptor(fpv)
+                self.feature_database.append(VLAD)
+                self.count += 1
+            # If in navigation stage
+            elif self._state[1] == vis_nav_game.Phase.NAVIGATION:
+                # TODO: could you do something else, something smarter than simply getting the image closest to the current FPV?
+                
+                # Key the state of the keys
+                keys = pygame.key.get_pressed()
+                # If 'q' key is pressed, then display the next best view based on the current FPV
+                if keys[pygame.K_q]:
+                    pass    # TODO: 实现导航功能
+
+        # Display the first-person view image on the pygame screen
+        rgb = convert_opencv_img_to_pygame(fpv)
+        self.screen.blit(rgb, (0, 0))
+        pygame.display.update()
+
+    def _load_exploration_data(self) -> Tuple[List[np.ndarray], List[int]]:
         """加载探索数据
         Returns:
             images: List[np.ndarray] 图像列表
             image_ids: List[int] 图像ID列表
         """
-        save_dir = "data/images_subsample/"
-        image_files = natsorted([x for x in os.listdir(save_dir) if x.endswith('.jpg')])
+        image_files = natsorted([x for x in os.listdir(data_path) if x.endswith('.jpg')])
         images = []
         image_ids = []
         
         for img_file in image_files:
-            img = cv2.imread(os.path.join(save_dir, img_file))
+            img = cv2.imread(os.path.join(data_path, img_file))
             if img is not None:
                 images.append(img)
                 image_ids.append(int(img_file.split('.')[0]))
                 
         return images, image_ids
+    
+
+if __name__ == "__main__":
+    os.makedirs(data_path, exist_ok=True)
+    player = SolutionPlayer()
+    vis_nav_game.play(player)
