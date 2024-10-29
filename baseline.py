@@ -1,4 +1,5 @@
 # import necessary libraries and modules
+import threading
 from vis_nav_game import Player, Action, Phase
 import pygame
 import cv2
@@ -8,6 +9,11 @@ import os
 import pickle
 from sklearn.cluster import KMeans
 from sklearn.neighbors import BallTree
+from umap import UMAP
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from natsort import natsorted
+from tqdm import tqdm
 
 
 # Define a class for a player controlled by keyboard input using pygame
@@ -30,9 +36,24 @@ class KeyboardPlayerPyGame(Player):
         # Load pre-trained codebook for VLAD encoding
         # If you do not have this codebook comment the following line
         # You can explore the maze once and generate the codebook (refer line 181 onwards for more)
-        self.codebook = pickle.load(open("codebook.pkl", "rb"))
+        self.codebook = None
         # Initialize database for storing VLAD descriptors of FPV
-        self.database = []
+        self.database = None
+        self.sift_descriptors = None  # SIFT descriptors of images in the database
+        self.tree = None  # BallTree for nearest neighbor search
+        self.goal = None  # Goal ID
+
+        # 降维并可视化特征
+        self.embedded_coords = None     # 降维后的坐标
+        self.cluster_labels = None      # 聚类标签
+        self.nav_figure = None          # matplotlib图像
+        self.current_position = None    # 当前位置
+        self.goal_position = None       # 目标位置
+        self.visulization_lock = threading.Lock()  # 线程锁
+
+        # 参数
+        self.n_neighbors = 15           # 邻居数量
+        self.n_clusters = 64            # 聚类数量
 
     def reset(self):
         # Reset the player state
@@ -139,11 +160,10 @@ class KeyboardPlayerPyGame(Player):
         """
         Compute SIFT features for images in the data directory
         """
-        length = len(os.listdir(self.save_dir))
+        files = natsorted([x for x in os.listdir(self.save_dir) if x.endswith('.jpg')])
         sift_descriptors = list()
-        for i in range(length):
-            path = str(i) + ".jpg"
-            img = cv2.imread(os.path.join(self.save_dir, path))
+        for img in tqdm(files, desc="Processing images"):
+            img = cv2.imread(os.path.join(self.save_dir, img))
             # Pass the image to sift detector and get keypoints + descriptions
             # We only need the descriptors
             # These descriptors represent local features extracted from the image.
@@ -213,10 +233,19 @@ class KeyboardPlayerPyGame(Player):
         Build BallTree for nearest neighbor search and find the goal ID
         """
         # If this function is called after the game has started
-        if self.count > 0:
-            # below 3 code lines to be run only once to generate the codebook
-            # Compute sift features for images in the database
-            sift_descriptors = self.compute_sift_features()
+
+        # Compute sift features for images in the database
+        if self.sift_descriptors is None:
+            if os.path.exists("sift_descriptors.npy"):
+                print("Loaded SIFT features from sift_descriptors.npy")
+                self.sift_descriptors = np.load("sift_descriptors.npy")
+            else:
+                print("Computing SIFT features...")
+                self.sift_descriptors = self.compute_sift_features()
+                np.save("sift_descriptors.npy", self.sift_descriptors)
+        else:
+            pass
+            # print("Loaded SIFT features from sift_descriptors.npy")
 
             # KMeans clustering algorithm is used to create a visual vocabulary, also known as a codebook,
             # from the computed SIFT descriptors.
@@ -229,21 +258,49 @@ class KeyboardPlayerPyGame(Player):
             # This fits the KMeans model to the SIFT descriptors, clustering them into n_clusters clusters based on their feature vectors
 
             # TODO: try tuning the function parameters for better performance
-            codebook = KMeans(n_clusters = 64, init='k-means++', n_init=10, verbose=1).fit(sift_descriptors)
-            pickle.dump(codebook, open("codebook.pkl", "wb"))
+        if self.codebook is None:
+            if os.path.exists("codebook.pkl"):
+                self.codebook = pickle.load(open("codebook.pkl", "rb"))
+            else:
+                print("Computing codebook...")
+                self.codebook = KMeans(n_clusters=128, init='k-means++', n_init=5, verbose=1).fit(self.sift_descriptors)
+                pickle.dump(self.codebook, open("codebook.pkl", "wb"))
+        else:
+            pass
+            # print("Loaded codebook from codebook.pkl")
+        
+        # get VLAD emvedding for each image in the exploration phase
+        if self.database is None:
+            if os.path.exists("database.npy"):
+                print("Loaded database from database.npy")
+                self.database = np.load("database.npy")
+            else:
+                self.database = []
+                print("Computing VLAD embeddings...")
+                exploration_observation = natsorted([x for x in os.listdir(self.save_dir) if x.endswith('.jpg')])
+                for img in tqdm(exploration_observation, desc="Processing images"):
+                    img = cv2.imread(os.path.join(self.save_dir, img))
+                    VLAD = self.get_VLAD(img)
+                    self.database.append(VLAD)
+                self.database = np.array(self.database)
+                np.save("database.npy", self.database)
 
             # Build a BallTree for fast nearest neighbor search
             # We create this tree to efficiently perform nearest neighbor searches later on which will help us navigate and reach the target location
             
             # TODO: try tuning the leaf size for better performance
-            tree = BallTree(self.database, leaf_size=60)
-            self.tree = tree
+        if self.tree is None:
+            if os.path.exists("tree.pkl"):
+                self.tree = pickle.load(open("tree.pkl", "rb"))
+            else:
+                print("Building BallTree...")
+                tree = BallTree(self.database, leaf_size=60)
+                self.tree = tree
+                pickle.dump(self.tree, open("tree.pkl", "wb"))
 
-            # Get the neighbor nearest to the front view of the target image and set it as goal
-            targets = self.get_target_images()
-            index = self.get_neighbor(targets[0])
-            self.goal = index
-            print(f'Goal ID: {self.goal}')
+        # Display the navigation map
+        print("Creating navigation map...")
+        self.create_navigation_map()
 
     def pre_navigation(self):
         """
@@ -263,10 +320,16 @@ class KeyboardPlayerPyGame(Player):
         # Get the neighbor of current FPV
         # In other words, get the image from the database that closely matches current FPV
         index = self.get_neighbor(self.fpv)
-        # Display the image 5 frames ahead of the neighbor, so that next best view is not exactly same as current FPV
-        self.display_img_from_id(index+5, f'Next Best View')
-        # Display the next best view id along with the goal id to understand how close/far we are from the goal
-        print(f'Next View ID: {index+5} || Goal ID: {self.goal}')
+
+        # 更新当前位置
+        self.current_position = self.embedded_coords[index]
+        self.update_navigation_visualization()
+
+        # 原先的代码
+        # # Display the image 5 frames ahead of the neighbor, so that next best view is not exactly same as current FPV
+        # self.display_img_from_id(index+5, f'Next Best View')
+        # # Display the next best view id along with the goal id to understand how close/far we are from the goal
+        # print(f'Next View ID: {index+5} || Goal ID: {self.goal}')
 
     def see(self, fpv):
         """
@@ -306,22 +369,17 @@ class KeyboardPlayerPyGame(Player):
                 # TODO: could you employ any technique to strategically perform exploration instead of random exploration
                 # to improve performance (reach target location faster)?
 
-                # Get full absolute save path
-                save_dir_full = os.path.join(os.getcwd(),self.save_dir)
-                save_path = save_dir_full + str(self.count) + ".jpg"
-                # Create path if it does not exist
-                if not os.path.isdir(save_dir_full):
-                    os.mkdir(save_dir_full)
-                # Save current FPV
-                cv2.imwrite(save_path, fpv)
-
-                # Get VLAD embedding for current FPV and add it to the database
-                VLAD = self.get_VLAD(self.fpv)
-                self.database.append(VLAD)
-                self.count = self.count + 1
+                pass
             # If in navigation stage
             elif self._state[1] == Phase.NAVIGATION:
                 # TODO: could you do something else, something smarter than simply getting the image closest to the current FPV?
+
+                if self.goal is None:
+                    # Get the neighbor nearest to the front view of the target image and set it as goal
+                    targets = self.get_target_images()
+                    index = self.get_neighbor(targets[0])
+                    self.goal = index
+                    print(f'Goal ID: {self.goal}')
                 
                 # Key the state of the keys
                 keys = pygame.key.get_pressed()
@@ -333,6 +391,71 @@ class KeyboardPlayerPyGame(Player):
         rgb = convert_opencv_img_to_pygame(fpv)
         self.screen.blit(rgb, (0, 0))
         pygame.display.update()
+
+    def create_navigation_map(self):
+        """
+        创建导航地图
+        """
+        X = np.array(self.database) # 数据库
+
+        # 降维
+        reducer = UMAP(n_neighbors=self.n_neighbors, n_components=2, random_state=0)
+        self.embedded_coords = reducer.fit_transform(X)
+
+        # 聚类
+        km = KMeans(n_clusters=self.n_clusters, random_state=0)
+        self.cluster_labels = km.fit_predict(X)
+
+        # 可视化
+        self.nav_figure = plt.figure(figsize=(10, 10))
+        self.update_navigation_visualization()
+
+    def update_navigation_visualization(self):
+        """
+        更新导航可视化，显示当前位置在地图上的位置
+        """
+        with self.visulization_lock:
+            plt.clf()
+
+            # 绘制所有点
+            plt.scatter(self.embedded_coords[:, 0], 
+                            self.embedded_coords[:, 1],
+                            c=self.cluster_labels, 
+                            cmap='tab10', 
+                            alpha=0.6, 
+                            s=2)
+
+            # 绘制当前位置
+            if self.current_position is not None:
+                plt.scatter(self.current_position[0], 
+                            self.current_position[1], 
+                            c='r', 
+                            marker='x', 
+                            s=10, 
+                            label='Current Position')
+                
+            # 绘制目标位置
+            if self.goal_position is not None:
+                plt.scatter(self.goal_position[0], 
+                            self.goal_position[1], 
+                            c='g', 
+                            marker='^', 
+                            s=10, 
+                            label='Goal Position')
+                
+            plt.legend()
+            plt.title('Navigation Map')
+
+            # 将图像转换为OpenCV格式
+            canvas = FigureCanvasAgg(self.nav_figure)
+            canvas.draw()
+            nav_map = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
+            nav_map = nav_map.reshape(canvas.get_width_height()[::-1] + (3,))
+            nav_map = cv2.cvtColor(nav_map, cv2.COLOR_RGB2BGR)
+
+            # 显示导航地图
+            cv2.imshow('Navigation Map', nav_map)
+            cv2.waitKey(1)
 
 
 if __name__ == "__main__":

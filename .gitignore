@@ -9,5 +9,9 @@ __pycache__/
 data/
 /dist
 *egg-info
+database.npy
+codebook.pkl
+sift_descriptors.npy
+tree.pkl
 
 /.conda
