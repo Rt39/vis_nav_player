@@ -8,6 +8,7 @@ import numpy as np
 import os
 import pickle
 from sklearn.cluster import KMeans
+from sklearn.manifold import TSNE
 from sklearn.neighbors import BallTree
 from umap import UMAP
 import matplotlib.pyplot as plt
@@ -54,6 +55,9 @@ class KeyboardPlayerPyGame(Player):
         # 参数
         self.n_neighbors = 15           # 邻居数量
         self.n_clusters = 64            # 聚类数量
+
+        self.current_rotation = 0       # 当前旋转角度
+        self.DEGREE_PER_ROTATION = 2.5  # 每次旋转的角度
 
     def reset(self):
         # Reset the player state
@@ -329,7 +333,7 @@ class KeyboardPlayerPyGame(Player):
         # # Display the image 5 frames ahead of the neighbor, so that next best view is not exactly same as current FPV
         # self.display_img_from_id(index+5, f'Next Best View')
         # # Display the next best view id along with the goal id to understand how close/far we are from the goal
-        # print(f'Next View ID: {index+5} || Goal ID: {self.goal}')
+        print(f'View ID: {index} || Goal ID: {self.goal}')
 
     def see(self, fpv):
         """
@@ -379,6 +383,7 @@ class KeyboardPlayerPyGame(Player):
                     targets = self.get_target_images()
                     index = self.get_neighbor(targets[0])
                     self.goal = index
+                    self.goal_position = self.embedded_coords[index]
                     print(f'Goal ID: {self.goal}')
                 
                 # Key the state of the keys
@@ -386,6 +391,11 @@ class KeyboardPlayerPyGame(Player):
                 # If 'q' key is pressed, then display the next best view based on the current FPV
                 if keys[pygame.K_q]:
                     self.display_next_best_view()
+
+                if keys[pygame.K_LEFT]:
+                    self.current_rotation -= self.DEGREE_PER_ROTATION
+                if keys[pygame.K_RIGHT]:
+                    self.current_rotation += self.DEGREE_PER_ROTATION
 
         # Display the first-person view image on the pygame screen
         rgb = convert_opencv_img_to_pygame(fpv)
@@ -399,61 +409,107 @@ class KeyboardPlayerPyGame(Player):
         X = np.array(self.database) # 数据库
 
         # 降维
-        reducer = UMAP(n_neighbors=self.n_neighbors, n_components=2, random_state=0)
-        self.embedded_coords = reducer.fit_transform(X)
+        if self.embedded_coords is None:
+            if os.path.exists("embedded_coords.pkl"):
+                print("Loaded embedded coordinates from embedded_coords.pkl")
+                self.embedded_coords = pickle.load(open("embedded_coords.pkl", "rb"))
+            else:
+                print("Computing TSNE embedding...")
+                tsne = TSNE(n_components=2, perplexity=30, n_iter=300)
+                self.embedded_coords = tsne.fit_transform(X)
+                pickle.dump(self.embedded_coords, open("embedded_coords.pkl", "wb"))
 
         # 聚类
-        km = KMeans(n_clusters=self.n_clusters, random_state=0)
-        self.cluster_labels = km.fit_predict(X)
+        if self.cluster_labels is None:
+            if os.path.exists("cluster_labels.pkl"):
+                print("Loaded cluster labels from cluster_labels.pkl")
+                self.cluster_labels = pickle.load(open("cluster_labels.pkl", "rb"))
+            else:
+                print("Clustering...")
+                km = KMeans(n_clusters=self.n_clusters, random_state=0)
+                self.cluster_labels = km.fit_predict(X)
+                pickle.dump(self.cluster_labels, open("cluster_labels.pkl", "wb"))
 
         # 可视化
-        self.nav_figure = plt.figure(figsize=(10, 10))
+        self.nav_figure = plt.figure(figsize=(12, 9))
         self.update_navigation_visualization()
 
     def update_navigation_visualization(self):
-        """
-        更新导航可视化，显示当前位置在地图上的位置
-        """
         with self.visulization_lock:
             plt.clf()
-
-            # 绘制所有点
-            plt.scatter(self.embedded_coords[:, 0], 
-                            self.embedded_coords[:, 1],
-                            c=self.cluster_labels, 
-                            cmap='tab10', 
-                            alpha=0.6, 
-                            s=2)
-
+            
+            # 创建子图网格,左边是导航地图,右边是指南针
+            gs = plt.GridSpec(1, 4, figure=self.nav_figure)
+            ax_map = plt.subplot(gs[0, :3])  # 导航地图占3/4
+            ax_compass = plt.subplot(gs[0, 3])  # 指南针占1/4
+            
+            # 1. 绘制导航地图部分
+            scatter = ax_map.scatter(self.embedded_coords[:, 0], 
+                                self.embedded_coords[:, 1],
+                                c=self.cluster_labels, 
+                                cmap='tab10', 
+                                alpha=0.6, 
+                                s=2)
+            
             # 绘制当前位置
             if self.current_position is not None:
-                plt.scatter(self.current_position[0], 
+                ax_map.scatter(self.current_position[0], 
                             self.current_position[1], 
                             c='r', 
                             marker='x', 
-                            s=10, 
+                            s=150, 
                             label='Current Position')
                 
             # 绘制目标位置
-            if self.goal_position is not None:
-                plt.scatter(self.goal_position[0], 
-                            self.goal_position[1], 
-                            c='g', 
+            if self.goal is not None:
+                goal_pos = self.embedded_coords[self.goal]
+                ax_map.scatter(goal_pos[0], 
+                            goal_pos[1], 
+                            c='r', 
                             marker='^', 
-                            s=10, 
+                            s=150, 
                             label='Goal Position')
                 
-            plt.legend()
-            plt.title('Navigation Map')
-
-            # 将图像转换为OpenCV格式
+            ax_map.legend()
+            ax_map.set_title('Navigation Map')
+            
+            # 2. 绘制指南针部分
+            ax_compass.set_aspect('equal')
+            
+            # 绘制指南针圆圈
+            circle = plt.Circle((0, 0), 1, color='lightgrey', fill=True)
+            ax_compass.add_artist(circle)
+            
+            # 绘制方向标记
+            directions = ['N', 'E', 'S', 'W']
+            angles = [90, 0, 270, 180]
+            for direction, angle in zip(directions, angles):
+                rad = np.deg2rad(angle)
+                x, y = np.cos(rad), np.sin(rad)
+                ax_compass.text(x * 1.1, y * 1.1, direction, 
+                            ha='center', va='center', 
+                            fontsize=12, fontweight='bold')
+            
+            # 绘制指南针指针
+            rotation_rad = np.deg2rad(90 - self.current_rotation)
+            needle_x, needle_y = np.cos(rotation_rad), np.sin(rotation_rad)
+            ax_compass.plot([0, needle_x], [0, needle_y], 
+                        color='red', linewidth=3)
+            
+            # 设置指南针的显示范围和样式
+            ax_compass.set_xlim(-1.5, 1.5)
+            ax_compass.set_ylim(-1.5, 1.5)
+            ax_compass.axis('off')
+            ax_compass.set_title('Compass')
+            
+            # 3. 调整布局
+            plt.tight_layout()
+            
+            # 4. 转换并显示
             canvas = FigureCanvasAgg(self.nav_figure)
             canvas.draw()
-            nav_map = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
-            nav_map = nav_map.reshape(canvas.get_width_height()[::-1] + (3,))
-            nav_map = cv2.cvtColor(nav_map, cv2.COLOR_RGB2BGR)
-
-            # 显示导航地图
+            nav_map = np.asarray(canvas.buffer_rgba())
+            nav_map = cv2.cvtColor(nav_map, cv2.COLOR_RGBA2BGR)
             cv2.imshow('Navigation Map', nav_map)
             cv2.waitKey(1)
 
